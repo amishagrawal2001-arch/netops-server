@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+systemctl stop netops-server 2>/dev/null || true
+systemctl disable netops-server 2>/dev/null || true

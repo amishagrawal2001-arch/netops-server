@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+# Install npm dependencies
+cd /opt/netops-server
+npm install --production --no-optional 2>/dev/null || true
+
+# Compile TypeScript
+npx tsc 2>/dev/null || true
+
+# Enable and start service
+systemctl daemon-reload
+systemctl enable netops-server
+systemctl start netops-server
+
+echo ""
+echo "✅ NetOps Server installed and started!"
+echo "   Status:  systemctl status netops-server"
+echo "   Logs:    journalctl -u netops-server -f"
+echo "   API:     http://localhost:4000/api/status"
+echo ""

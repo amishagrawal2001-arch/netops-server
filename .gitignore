@@ -1,0 +1,6 @@
+node_modules/
+dist/
+build/
+*.tar.gz
+*.deb
+*.rpm

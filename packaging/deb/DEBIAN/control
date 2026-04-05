@@ -1,0 +1,19 @@
+Package: netops-server
+Version: 1.0.0
+Section: net
+Priority: optional
+Architecture: all
+Depends: nodejs (>= 18.0.0)
+Maintainer: Tlink Technologies <support@tlink.io>
+Description: NetOps Backend Server
+ Optional standalone backend server for large-scale NetOps
+ network device polling via SSH/SNMP. Offloads polling from
+ the Electron desktop client to a centralized server.
+ Supports REST API + WebSocket for real-time streaming.
+ .
+ Features:
+  - SSH polling for 13+ network vendors
+  - LLDP/CDP network discovery
+  - Config backup and change management
+  - WebSocket streaming for real-time updates
+  - Connection pooling (50 max, 3 per host)
