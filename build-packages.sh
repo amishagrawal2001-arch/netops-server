@@ -19,15 +19,19 @@ npm install 2>/dev/null
 npx tsc
 npm prune --production 2>/dev/null
 
-# ── Build .tar.gz (generic Linux) ──────────────────────────────
-echo "📦 Building tarball..."
+# ── Build .tar.gz (self-contained, no internet needed) ─────────
+echo "📦 Building self-contained tarball..."
+
+# Install production deps for bundling
+npm install --production 2>/dev/null
+
 TAR_DIR="$BUILD_DIR/${NAME}-${VERSION}"
 mkdir -p "$TAR_DIR"
-cp -r package.json tsconfig.json src/ dist/ install.sh README.md Dockerfile docker-compose.yml "$TAR_DIR/"
+cp -r package.json src/ dist/ node_modules/ install.sh README.md Dockerfile docker-compose.yml "$TAR_DIR/"
 cd "$BUILD_DIR"
 tar czf "${NAME}-${VERSION}-linux.tar.gz" "${NAME}-${VERSION}/"
 cd ..
-echo "   ✓ build/${NAME}-${VERSION}-linux.tar.gz"
+echo "   ✓ build/${NAME}-${VERSION}-linux.tar.gz (self-contained)"
 
 # ── Build .deb (Debian/Ubuntu) ─────────────────────────────────
 echo "📦 Building .deb package..."

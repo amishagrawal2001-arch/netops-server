@@ -9,6 +9,26 @@ Optional standalone backend server for large-scale network polling. Offloads SSH
 - **Always-on**: Server polls 24/7 even when client app is closed
 - **Secure**: SSH credentials stay on the server, not on laptops
 
+# On your Mac — build the tarball:
+cd /Users/surajsharma/dev/netops-server
+./build-packages.sh
+
+# Copy to Linux server:
+scp build/netops-server-1.0.0-linux.tar.gz user@server:~/
+
+# On Linux server:
+tar xzf netops-server-1.0.0-linux.tar.gz
+cd netops-server-1.0.0
+./install.sh
+
+
+##deb package (Ubuntu/Debian — build ON the Linux server)
+
+scp -r /Users/surajsharma/dev/netops-server user@server:~/netops-server
+ssh user@server "cd netops-server && ./build-packages.sh"
+ssh user@server "sudo dpkg -i netops-server/build/netops-server_1.0.0_all.deb"
+
+
 ## Quick Start
 
 ### Option 1: Direct Install (Linux)
