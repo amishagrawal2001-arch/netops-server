@@ -26,12 +26,28 @@ echo "📦 Building self-contained tarball..."
 npm install --production 2>/dev/null
 
 TAR_DIR="$BUILD_DIR/${NAME}-${VERSION}"
+rm -rf "$TAR_DIR"
 mkdir -p "$TAR_DIR"
-cp -r package.json src/ dist/ node_modules/ install.sh README.md Dockerfile docker-compose.yml "$TAR_DIR/"
+cp package.json install.sh README.md Dockerfile docker-compose.yml "$TAR_DIR/"
+cp -R src "$TAR_DIR/src"
+cp -R dist "$TAR_DIR/dist"
+cp -R node_modules "$TAR_DIR/node_modules"
 cd "$BUILD_DIR"
-tar czf "${NAME}-${VERSION}-linux.tar.gz" "${NAME}-${VERSION}/"
+# Use GNU tar (gtar) to avoid Apple metadata warnings on Linux
+if command -v gtar &>/dev/null; then
+    gtar czf "${NAME}-${VERSION}-linux.tar.gz" "${NAME}-${VERSION}/"
+else
+    COPYFILE_DISABLE=1 tar czf "${NAME}-${VERSION}-linux.tar.gz" "${NAME}-${VERSION}/"
+    echo "   ⚠ Install gnu-tar (brew install gnu-tar) to eliminate Apple metadata warnings"
+fi
 cd ..
 echo "   ✓ build/${NAME}-${VERSION}-linux.tar.gz (self-contained)"
+
+# Verify contents
+echo "   Verifying tarball structure..."
+tar tzf "$BUILD_DIR/${NAME}-${VERSION}-linux.tar.gz" | head -5
+CONTENTS=$(tar tzf "$BUILD_DIR/${NAME}-${VERSION}-linux.tar.gz" | grep -c "node_modules/")
+echo "   ✓ ${CONTENTS} files in node_modules/"
 
 # ── Build .deb (Debian/Ubuntu) ─────────────────────────────────
 echo "📦 Building .deb package..."
