@@ -124,45 +124,169 @@ interface ShellParams {
     password: string
     commands: string[]
     delayMs?: number
+    /** Hard upper bound for the whole session. Default: scaled with command count. */
+    timeoutMs?: number
 }
 
+/**
+ * Open an interactive SSH shell, send commands with a delay, then gracefully exit.
+ *
+ * Robustness notes:
+ *   - Control characters (e.g. Juniper's Ctrl-D = \x04) MUST be sent raw without \n.
+ *   - Network device shells often do NOT close cleanly after `exit`, so we always
+ *     have a grace timer that resolves with the collected output.
+ *   - A hard session timeout ensures we never hang the request indefinitely.
+ *   - Output is scanned for common device error patterns so that a rejected
+ *     config push returns ok=false instead of masquerading as success.
+ */
 function sshShellSession (params: ShellParams): Promise<{ ok: boolean; output: string; error?: string }> {
     return new Promise((resolve) => {
         const client = new Client()
         const delay = params.delayMs || 300
+        // Scale session budget with command count; floor at 120s.
+        const sessionBudget = params.timeoutMs ?? Math.max(120_000, params.commands.length * 500 + 60_000)
         let output = ''
         let settled = false
+
+        const hardTimer = setTimeout(() => {
+            done({
+                ok: false,
+                output,
+                error: `Session timed out after ${sessionBudget / 1000}s on ${params.host}`,
+            })
+        }, sessionBudget)
 
         function done (result: { ok: boolean; output: string; error?: string }): void {
             if (settled) { return }
             settled = true
+            clearTimeout(hardTimer)
             try { client.end() } catch { /* no-op */ }
             resolve(result)
         }
 
-        client.on('ready', () => {
-            client.shell((err, stream) => {
-                if (err) { done({ ok: false, output: '', error: err.message }); return }
+        // Inspect accumulated output for vendor-agnostic device error patterns.
+        //
+        // Success/failure precedence:
+        //   1. Explicit commit-failure markers ALWAYS override any success signals.
+        //   2. Explicit commit-success markers (Juniper `commit complete`, Nokia
+        //      `commit successful`, Arista `copy ... OK`) signal success even if
+        //      earlier benign errors appeared in output (e.g. a `cli` no-op on
+        //      physical QFX, or a `write memory` noise line).
+        //   3. Otherwise, generic error patterns fail the push.
+        function checkOutputForErrors (): { ok: boolean; output: string; error?: string } {
+            const trimmed = output.trim()
 
-                stream.on('data', (data: Buffer) => { output += data.toString() })
-                stream.on('close', () => { done({ ok: true, output }) })
-
-                // Send commands with delays
-                let i = 0
-                const sendNext = (): void => {
-                    if (i < params.commands.length) {
-                        stream.write(params.commands[i] + '\n')
-                        i++
-                        setTimeout(sendNext, delay)
-                    } else {
-                        setTimeout(() => stream.end(), delay * 2)
+            // ── Hard failures — these override any success signal ─────────────
+            const failurePatterns = [
+                /commit\s+failed/i,
+                /commit\s+check\s+failed/i,
+                /configuration\s+check-out\s+failed/i,
+                /failed to commit/i,
+                /authorization\s+failed/i,
+                /permission\s+denied/i,
+            ]
+            for (const p of failurePatterns) {
+                if (p.test(trimmed)) {
+                    const lines = trimmed.split('\n')
+                    const errLine = lines.find(l => p.test(l)) ?? ''
+                    const tail = trimmed.length > 400 ? '…' + trimmed.slice(-400) : trimmed
+                    return {
+                        ok: false,
+                        output: trimmed,
+                        error: `Device error on ${params.host}: ${errLine.trim()} · output: ${tail}`,
                     }
                 }
-                sendNext()
+            }
+
+            // ── Explicit success markers — trust these even if earlier output
+            //    had benign errors (e.g. unknown-command from prefix commands) ──
+            const successPatterns = [
+                /commit\s+complete/i,          // Juniper
+                /commit\s+successful/i,        // Nokia SR Linux / SR-OS
+                /\[ok\]/i,                     // SR Linux "[ok]"
+                /save complete/i,              // Generic save
+                /configuration\s+saved/i,      // Generic save
+                /copy\s+complete/i,            // Cisco `copy run start`
+                /\[ok\]\s*$/im,                // Generic ok line
+            ]
+            if (successPatterns.some(p => p.test(trimmed))) {
+                return { ok: true, output: trimmed }
+            }
+
+            // ── Otherwise, generic error patterns fail the push ───────────────
+            const errorPatterns = [
+                /error:\s+configuration/i,
+                /syntax error/i,
+                /invalid (?:input|command)/i,
+                /ambiguous command/i,
+                /unrecognized command/i,
+                /% incomplete command/i,
+                /% unknown /i,
+                /% invalid /i,
+            ]
+            const match = errorPatterns.find(p => p.test(trimmed))
+            if (match) {
+                const lines = trimmed.split('\n')
+                const errLine = lines.find(l => match.test(l)) ?? ''
+                const tail = trimmed.length > 400 ? '…' + trimmed.slice(-400) : trimmed
+                return {
+                    ok: false,
+                    output: trimmed,
+                    error: `Device error on ${params.host}: ${errLine.trim()} · output: ${tail}`,
+                }
+            }
+            return { ok: true, output: trimmed }
+        }
+
+        client.on('ready', () => {
+            client.shell((err, stream) => {
+                if (err) { done({ ok: false, output: '', error: `SSH shell failed: ${err.message}` }); return }
+
+                stream.on('data', (data: Buffer) => { output += data.toString() })
+                stream.stderr.on('data', (data: Buffer) => { output += data.toString() })
+
+                stream.on('close', () => { done(checkOutputForErrors()) })
+                stream.on('error', (streamErr: Error) => {
+                    done({ ok: false, output, error: `SSH shell stream error on ${params.host}: ${streamErr.message}` })
+                })
+
+                // Send commands sequentially with delays.
+                let i = 0
+                let stopped = false
+                const sendNext = (): void => {
+                    if (settled || stopped) { return }
+                    if (i < params.commands.length) {
+                        const cmd = params.commands[i++]
+                        try {
+                            // Control chars (e.g. Juniper Ctrl-D = \x04) must be sent raw
+                            if (cmd.length === 1 && cmd.charCodeAt(0) < 32) {
+                                stream.write(cmd)
+                            } else {
+                                stream.write(cmd + '\n')
+                            }
+                        } catch { stopped = true; return }
+                        setTimeout(sendNext, delay)
+                    } else {
+                        // All commands sent — give the device time to process the last
+                        // commit/save, then send `exit` to close the shell. If the shell
+                        // doesn't close within 10s, resolve with whatever we have.
+                        setTimeout(() => {
+                            try { stream.end('exit\n') } catch { /* no-op */ }
+                            setTimeout(() => {
+                                if (!settled) { done(checkOutputForErrors()) }
+                            }, 10_000)
+                        }, delay * 2)
+                    }
+                }
+                // Wait for the initial prompt before sending.
+                setTimeout(sendNext, delay)
             })
         })
 
-        client.on('error', (err) => { done({ ok: false, output, error: err.message }) })
+        client.on('error', (err) => { done({ ok: false, output, error: `SSH connection failed: ${err.message}` }) })
+        client.on('close', () => {
+            if (!settled) { done({ ok: false, output, error: 'SSH connection closed unexpectedly' }) }
+        })
 
         try {
             client.connect({
@@ -289,13 +413,19 @@ app.post('/api/discover', async (req, res) => {
 })
 
 app.post('/api/load-config', async (req, res) => {
-    const { host, port, username, password, commands, delayMs } = req.body
+    const { host, port, username, password, commands, delayMs, timeoutMs } = req.body
     console.log(`[LOAD-CONFIG] ${host}:${port || 22} — ${commands?.length || 0} commands`)
     if (!host || !username || !password || !commands?.length) {
         return res.status(400).json({ ok: false, error: 'Missing required fields' })
     }
-    const result = await sshShellSession({ host, port, username, password, commands, delayMs: delayMs || 300 })
-    console.log(`[LOAD-CONFIG] ${host} — ${result.ok ? 'OK' : 'FAILED'}`)
+    const result = await sshShellSession({ host, port, username, password, commands, delayMs: delayMs || 300, timeoutMs })
+    if (result.ok) {
+        console.log(`[LOAD-CONFIG] ${host} — OK (${result.output.length} chars)`)
+    } else {
+        const tail = (result.output || '').trim().slice(-400)
+        console.log(`[LOAD-CONFIG] ${host} — FAILED: ${result.error}`)
+        if (tail) { console.log(`[LOAD-CONFIG] ${host} — device said: …${tail}`) }
+    }
     res.json(result)
 })
 
@@ -305,19 +435,48 @@ import { execSync, exec as execCb } from 'child_process'
 import { promisify } from 'util'
 const execAsync = promisify(execCb)
 
+interface DockerServer { host: string; port?: number; username: string; password: string }
+
+/**
+ * Run a docker command either locally or on a remote server via SSH.
+ * When `server` is provided, the command is executed over SSH on that host.
+ * When omitted, the command runs locally via child_process.
+ */
+async function dockerCmd (
+    cmd: string,
+    server?: DockerServer,
+    timeoutMs = 15000,
+): Promise<{ stdout: string; stderr: string }> {
+    if (!server) {
+        return execAsync(cmd, { timeout: timeoutMs })
+    }
+    // Remote: run docker command over SSH on the target server
+    const result = await sshRunCommands({
+        host: server.host,
+        port: server.port ?? 22,
+        username: server.username,
+        password: server.password,
+        commands: [cmd],
+        timeoutMs,
+    })
+    if (!result.ok) { throw new Error(result.error || 'SSH command failed') }
+    return { stdout: result.outputs[0] || '', stderr: '' }
+}
+
 app.post('/api/container-poll', async (req, res) => {
-    const { containers } = req.body  // Array of { name, kind }
+    const { containers, server } = req.body  // containers: Array<{name, kind}>, server?: {host, port, username, password}
     if (!Array.isArray(containers) || !containers.length) {
         return res.status(400).json({ ok: false, error: 'Missing containers array' })
     }
 
-    console.log(`[CONTAINER-POLL] ${containers.length} containers`)
-    const results: Array<{ containerName: string; state: string; bgpNeighbors: any[] }> = []
+    const remote: DockerServer | undefined = server?.host ? server : undefined
+    console.log(`[CONTAINER-POLL] ${containers.length} containers${remote ? ` via SSH → ${remote.host}` : ' (local)'}`)
+    const results: Array<{ containerName: string; state: string; bgpNeighbors: any[]; srEnabled?: boolean; srLabelsCount?: number; vniActive?: number }> = []
 
     // Step 1: Docker inspect all containers for state
     try {
         const ids = containers.map(c => c.name).join(' ')
-        const { stdout } = await execAsync(`docker inspect --format '{{.Name}}|{{.State.Status}}' ${ids}`, { timeout: 10_000 })
+        const { stdout } = await dockerCmd(`docker inspect --format '{{.Name}}|{{.State.Status}}' ${ids}`, remote, 10_000)
         const stateMap = new Map<string, string>()
         for (const line of stdout.trim().split('\n')) {
             if (!line.includes('|')) continue
@@ -342,28 +501,100 @@ app.post('/api/container-poll', async (req, res) => {
 
                 if (bgpCmd) {
                     try {
-                        const { stdout: bgpOut } = await execAsync(`docker exec ${c.name} ${bgpCmd.join(' ')}`, { timeout: 15_000 })
-                        // Parse BGP output — simple text-based for now
-                        const ipRe = /(\d+\.\d+\.\d+\.\d+)/
-                        const stateWords = ['establ', 'active', 'connect', 'idle', 'openconfirm', 'opensent']
-                        for (const line of bgpOut.split('\n')) {
-                            const ipMatch = line.match(ipRe)
-                            if (!ipMatch) continue
-                            const lower = line.toLowerCase()
-                            let bgpState = 'unknown'
-                            for (const sw of stateWords) {
-                                if (lower.includes(sw)) { bgpState = sw === 'establ' ? 'established' : sw; break }
+                        const quotedArgs = bgpCmd.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')
+                        const cmdStr = `docker exec ${c.name} ${quotedArgs}`
+                        console.log(`[CONTAINER-POLL] BGP cmd: ${cmdStr}${remote ? ` (via ${remote.host})` : ''}`)
+                        const { stdout: bgpOut, stderr: bgpErr } = await dockerCmd(cmdStr, remote, 15_000)
+                        if (bgpErr) { console.log(`[CONTAINER-POLL] BGP stderr: ${bgpErr.trim().slice(0, 100)}`) }
+                        console.log(`[CONTAINER-POLL] BGP output (${bgpOut.length} chars): ${bgpOut.trim().slice(0, 200)}`)
+                        // Parse BGP output — try JSON first (FRR/SONiC/Arista), fall back to regex
+                        let parsed = false
+                        try {
+                            const json = JSON.parse(bgpOut.trim())
+                            // FRR/SONiC: { ipv4Unicast: { peers: { "10.0.0.1": { remoteAs, state, pfxRcd } } } }
+                            const afi = json.ipv4Unicast ?? json.ipv6Unicast ?? json
+                            const peers = afi.peers ?? json.peers ?? {}
+                            for (const [ip, info] of Object.entries<any>(peers)) {
+                                const rawState = (info.state || info.bgpState || '').toLowerCase()
+                                const state = rawState.includes('establ') ? 'established'
+                                    : rawState.includes('active') ? 'active'
+                                    : rawState.includes('connect') ? 'connect'
+                                    : rawState.includes('idle') ? 'idle'
+                                    : rawState.includes('opensent') ? 'opensent'
+                                    : rawState.includes('openconfirm') ? 'openconfirm'
+                                    : rawState || 'unknown'
+                                entry.bgpNeighbors.push({
+                                    neighborIp: ip,
+                                    state,
+                                    asn: info.remoteAs ?? info.asn ?? 0,
+                                    prefixCount: info.pfxRcd ?? info.prefixReceivedCount ?? 0,
+                                })
                             }
-                            if (bgpState === 'unknown' && !lower.includes('neighbor')) continue
-                            const asnMatch = line.match(/\b(\d{4,6})\b/)
-                            entry.bgpNeighbors.push({
-                                neighborIp: ipMatch[1],
-                                state: bgpState,
-                                asn: asnMatch ? Number(asnMatch[1]) : 0,
-                                prefixCount: 0,
-                            })
+                            parsed = Object.keys(peers).length > 0
+                            if (parsed) { console.log(`[CONTAINER-POLL] ${c.name}: parsed ${entry.bgpNeighbors.length} BGP peers from JSON`) }
+                        } catch { /* not JSON, fall through to regex */ }
+
+                        // Regex fallback for text-based outputs (Nokia SRL, Juniper cRPD, etc.)
+                        if (!parsed) {
+                            const ipRe = /(\d+\.\d+\.\d+\.\d+)/
+                            const stateWords = ['establ', 'active', 'connect', 'idle', 'openconfirm', 'opensent']
+                            for (const line of bgpOut.split('\n')) {
+                                const ipMatch = line.match(ipRe)
+                                if (!ipMatch) continue
+                                const lower = line.toLowerCase()
+                                let bgpState = 'unknown'
+                                for (const sw of stateWords) {
+                                    if (lower.includes(sw)) { bgpState = sw === 'establ' ? 'established' : sw; break }
+                                }
+                                if (bgpState === 'unknown' && !lower.includes('neighbor')) continue
+                                const asnMatch = line.match(/\b(\d{4,6})\b/)
+                                entry.bgpNeighbors.push({
+                                    neighborIp: ipMatch[1],
+                                    state: bgpState,
+                                    asn: asnMatch ? Number(asnMatch[1]) : 0,
+                                    prefixCount: 0,
+                                })
+                            }
                         }
-                    } catch { /* BGP query failed — skip */ }
+                    } catch (bgpErr: any) { console.log(`[CONTAINER-POLL] BGP failed for ${c.name}: ${bgpErr.message?.slice(0, 100)}`) }
+                }
+
+                // SR label count (best-effort, supports SONiC/FRR, Arista, Juniper, Nokia SRL)
+                let srCmd: string[] | null = null
+                if (kind.includes('sonic') || kind.includes('frr')) { srCmd = ['vtysh', '-c', 'show mpls table'] }
+                else if (kind.includes('ceos') || kind.includes('arista')) { srCmd = ['Cli', '-p', '15', '-c', 'show mpls label range'] }
+                else if (kind.includes('srl') || kind.includes('nokia')) { srCmd = ['sr_cli', '-d', 'show network-instance default segment-routing mpls'] }
+                else if (kind.includes('crpd') || kind.includes('juniper') || kind.includes('junos')) { srCmd = ['cli', '-c', 'show route table mpls.0'] }
+                if (srCmd) {
+                    try {
+                        const quoted = srCmd.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')
+                        const { stdout: srOut } = await dockerCmd(`docker exec ${c.name} ${quoted}`, remote, 10_000)
+                        const labels = (srOut || '').split('\n').filter(l => /\b(1[6-9]\d{3}|2\d{4})\b/.test(l))
+                        entry.srEnabled = labels.length > 0
+                        entry.srLabelsCount = labels.length
+                    } catch { /* skip */ }
+                }
+
+                // VNI count (best-effort, supports SONiC/FRR, Arista, Nokia SRL, Juniper)
+                let vniCmd: string[] | null = null
+                if (kind.includes('sonic') || kind.includes('frr')) { vniCmd = ['vtysh', '-c', 'show evpn vni json'] }
+                else if (kind.includes('ceos') || kind.includes('arista')) { vniCmd = ['Cli', '-p', '15', '-c', 'show vxlan vni | json'] }
+                else if (kind.includes('srl') || kind.includes('nokia')) { vniCmd = ['sr_cli', '-d', 'show tunnel-interface vxlan1 vxlan-interface 0'] }
+                else if (kind.includes('crpd') || kind.includes('juniper') || kind.includes('junos')) { vniCmd = ['cli', '-c', 'show ethernet-switching vxlan-tunnel-end-point remote'] }
+                if (vniCmd) {
+                    try {
+                        const quoted = vniCmd.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')
+                        const { stdout: vniOut } = await dockerCmd(`docker exec ${c.name} ${quoted}`, remote, 10_000)
+                        if (kind.includes('sonic') || kind.includes('frr')) {
+                            try {
+                                const json = JSON.parse(vniOut.trim())
+                                entry.vniActive = typeof json === 'object' ? Object.keys(json).length : 0
+                            } catch { entry.vniActive = 0 }
+                        } else {
+                            const vniLines = (vniOut || '').split('\n').filter(l => /\bvni\b/i.test(l) && /\d{4,}/.test(l))
+                            entry.vniActive = vniLines.length
+                        }
+                    } catch { /* skip */ }
                 }
             }
 
