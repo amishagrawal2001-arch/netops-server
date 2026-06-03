@@ -2,6 +2,7 @@
   "name": "netops-server",
   "version": "1.0.0",
   "description": "Optional standalone backend server for large-scale NetOps polling",
+  "license": "MIT",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
